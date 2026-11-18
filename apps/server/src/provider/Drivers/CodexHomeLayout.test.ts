@@ -865,6 +865,48 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
         }).pipe(Effect.provideService(HostProcess.Platform, "win32")),
     );
 
+    // regression: #24486 a Windows CODEX_SQLITE_HOME naming the shared home skipped the check for a
+    // legacy shadow WAL holding data, so those writes stayed stranded without a warning.
+    it.effect.skipIf(!symlinksSupported)(
+      "refuses stranded shadow WAL data when CODEX_SQLITE_HOME names the shared home on Windows",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const { sharedHome, shadowHome, layout } = yield* makeShadowLayout();
+          const shadowWal = path.join(shadowHome, "state_5.sqlite-wal");
+          yield* writeTextFile(path.join(sharedHome, "state_5.sqlite"), "db");
+          yield* fileSystem.symlink(
+            path.join(sharedHome, "state_5.sqlite"),
+            path.join(shadowHome, "state_5.sqlite"),
+          );
+          yield* writeTextFile(shadowWal, "uncheckpointed frames");
+
+          for (const spelling of [
+            sharedHome,
+            `${sharedHome}${path.sep}`,
+            sharedHome.toUpperCase(),
+          ]) {
+            for (const run of [materializeCodexShadowHome, codexHomeEnvironment]) {
+              const error = yield* run(layout, { CODEX_SQLITE_HOME: spelling }).pipe(Effect.flip);
+              expect(error).toBeInstanceOf(CodexShadowHomeSqliteConflictError);
+              expect(error).toMatchObject({ entryName: "state_5.sqlite-wal" });
+              expect(error).not.toHaveProperty("sqliteHomePath");
+            }
+          }
+          expect(yield* fileSystem.readFileString(shadowWal)).toBe("uncheckpointed frames");
+          expect(yield* fileSystem.exists(path.join(shadowHome, "sessions"))).toBe(false);
+
+          // An empty WAL holds nothing to lose, so the shared home is used as before.
+          yield* fileSystem.writeFileString(shadowWal, "");
+          for (const run of [materializeCodexShadowHome, codexHomeEnvironment]) {
+            expect(yield* run(layout, { CODEX_SQLITE_HOME: sharedHome })).toMatchObject(
+              yield* routedTo(sharedHome),
+            );
+          }
+        }).pipe(Effect.provideService(HostProcess.Platform, "win32")),
+    );
+
     it.effect.skipIf(!symlinksSupported || HostProcess.Platform.defaultValue() === "win32")(
       "keeps one WAL for a shared database a POSIX shadow opens through its link",
       () =>
